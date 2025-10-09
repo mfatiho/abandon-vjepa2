@@ -4,7 +4,7 @@ import logging
 import pathlib
 from dataclasses import dataclass, replace
 import argparse
-from typing import Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -18,6 +18,9 @@ from transformers import AutoModelForVideoClassification, AutoVideoProcessor
 
 LOGGER = logging.getLogger(__name__)
 
+if torch.cuda.is_available():  # enable cuDNN autotuner for faster kernels on GPUs
+    torch.backends.cudnn.benchmark = True
+
 DATASET_ROOT = pathlib.Path("data/UCF101_subset")
 HF_REPO = "facebook/vjepa2-vitl-fpc16-256-ssv2"
 RUN_DIR = pathlib.Path("runs/vjepa2_finetune")
@@ -27,6 +30,7 @@ RUN_DIR = pathlib.Path("runs/vjepa2_finetune")
 class TrainingConfig:
     """Container for the knobs we tweak during finetuning."""
 
+    learning_rate: float = 1e-5
     batch_size: int = 1
     num_workers: int = 8
     epochs: int = 5
@@ -34,6 +38,13 @@ class TrainingConfig:
     frames_stride: int = 3
     run_dir: pathlib.Path = RUN_DIR
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    use_amp: bool = True
+    zero_grad_set_to_none: bool = True
+    lr_decay_factor: float = 0.15
+    lr_patience: int = 7
+    max_lr_reductions: int = 3
+    min_learning_rate: float = 1e-7
+    early_stopping_patience: int = 11
 
 
 class VideoClassificationDataset(Dataset):
@@ -128,6 +139,7 @@ def build_dataloader(
 ) -> DataLoader:
     """Create a DataLoader with the configuration we use in training/eval."""
 
+    persistent_workers = num_workers > 0
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -135,6 +147,7 @@ def build_dataloader(
         collate_fn=collate_fn,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=persistent_workers,
     )
 
 
@@ -151,6 +164,8 @@ def evaluate(
     model: AutoModelForVideoClassification,
     processor: AutoVideoProcessor,
     device: torch.device,
+    *,
+    amp_enabled: bool,
 ) -> float:
     """Compute accuracy over a dataloader."""
 
@@ -160,7 +175,8 @@ def evaluate(
         for videos, labels in loader:
             inputs = processor(list(videos), return_tensors="pt").to(device)
             targets = labels.to(device)
-            logits = model(**inputs).logits
+            with torch.cuda.amp.autocast(enabled=amp_enabled):
+                logits = model(**inputs).logits
             predictions = logits.argmax(dim=-1)
             correct += (predictions == targets).sum().item()
             total += targets.size(0)
@@ -175,25 +191,41 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     accumulation_steps: int,
     epoch_index: int,
+    device: torch.device,
+    scaler: Optional[torch.cuda.amp.GradScaler],
+    zero_grad_set_to_none: bool,
+    amp_enabled: bool,
 ) -> None:
     """Run a single training epoch with gradient accumulation."""
 
     model.train()
     running_loss = 0.0
-    optimizer.zero_grad()
+    optimizer.zero_grad(set_to_none=zero_grad_set_to_none)
 
     steps_ran = 0
     for step, (videos, labels) in enumerate(loader, start=1):
         steps_ran = step
-        inputs = processor(list(videos), return_tensors="pt").to(model.device)
-        targets = labels.to(model.device)
-        outputs = model(**inputs, labels=targets)
-        (outputs.loss / accumulation_steps).backward()
-        running_loss += outputs.loss.item()
+        inputs = processor(list(videos), return_tensors="pt").to(device)
+        targets = labels.to(device)
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            outputs = model(**inputs, labels=targets)
+        loss = outputs.loss
+        if loss.ndim > 0:
+            loss = loss.mean()
+        loss_to_backprop = loss / accumulation_steps
+        if scaler is not None:
+            scaler.scale(loss_to_backprop).backward()
+        else:
+            loss_to_backprop.backward()
+        running_loss += loss.item()
 
         if step % accumulation_steps == 0:
-            optimizer.step()
-            optimizer.zero_grad()
+            if scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=zero_grad_set_to_none)
             LOGGER.info(
                 "Epoch %d | Step %d | Accumulated loss %.4f",
                 epoch_index,
@@ -204,8 +236,12 @@ def train_one_epoch(
 
     # Flush remaining gradients if the last batch did not align with accumulation steps.
     if steps_ran and steps_ran % accumulation_steps != 0:
-        optimizer.step()
-        optimizer.zero_grad()
+        if scaler is not None:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
+        optimizer.zero_grad(set_to_none=zero_grad_set_to_none)
 
 
 def maybe_run_demo(
@@ -213,6 +249,8 @@ def maybe_run_demo(
     model: AutoModelForVideoClassification,
     processor: AutoVideoProcessor,
     id_to_label: Mapping[int, str],
+    device: torch.device,
+    amp_enabled: bool,
 ) -> None:
     """Optional convenience demo using a single remote video."""
 
@@ -225,9 +263,10 @@ def maybe_run_demo(
 
     frame_indices = np.arange(0, 32)
     video_frames = decoder.get_frames_at(indices=frame_indices).data
-    inputs = processor(video_frames, return_tensors="pt").to(model.device)
+    inputs = processor(video_frames, return_tensors="pt").to(device)
     with torch.no_grad():
-        logits = model(**inputs).logits
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            logits = model(**inputs).logits
 
     predicted_class_idx = logits.argmax(dim=-1).item()
     LOGGER.info("Demo prediction: %s", id_to_label[predicted_class_idx])
@@ -252,14 +291,22 @@ def run_training(config: TrainingConfig) -> None:
         num_labels=num_labels,
         ignore_mismatched_sizes=True,
     ).to(config.device)
+    model_config = model.config
 
     processor = AutoVideoProcessor.from_pretrained(HF_REPO)
-    model.config.id2label = {idx: label for idx, label in id_to_label.items()}
-    model.config.label2id = {label: idx for idx, label in id_to_label.items()}
+    model_config.id2label = {idx: label for idx, label in id_to_label.items()}
+    model_config.label2id = {label: idx for idx, label in id_to_label.items()}
 
     freeze_backbone(model)
+    if torch.cuda.device_count() > 1 and config.device.type == "cuda":
+        LOGGER.info(
+            "Wrapping model with DataParallel across %d GPUs", torch.cuda.device_count()
+        )
+        model = torch.nn.DataParallel(model)
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]
-    optimizer = torch.optim.Adam(trainable_parameters, lr=1e-5)
+    optimizer = torch.optim.Adam(trainable_parameters, lr=config.learning_rate)
+    amp_enabled = config.use_amp and config.device.type == "cuda"
+    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled) if amp_enabled else None
 
     train_transforms = v2.Compose(
         [
@@ -279,7 +326,7 @@ def run_training(config: TrainingConfig) -> None:
         num_workers=config.num_workers,
         shuffle=True,
         collate_fn=build_collate_fn(
-            frames_per_clip=model.config.frames_per_clip,
+            frames_per_clip=model_config.frames_per_clip,
             transforms=train_transforms,
             frames_stride=config.frames_stride,
         ),
@@ -290,7 +337,7 @@ def run_training(config: TrainingConfig) -> None:
         num_workers=config.num_workers,
         shuffle=False,
         collate_fn=build_collate_fn(
-            frames_per_clip=model.config.frames_per_clip,
+            frames_per_clip=model_config.frames_per_clip,
             transforms=eval_transforms,
             frames_stride=config.frames_stride,
         ),
@@ -301,11 +348,22 @@ def run_training(config: TrainingConfig) -> None:
         num_workers=config.num_workers,
         shuffle=False,
         collate_fn=build_collate_fn(
-            frames_per_clip=model.config.frames_per_clip,
+            frames_per_clip=model_config.frames_per_clip,
             transforms=eval_transforms,
             frames_stride=config.frames_stride,
         ),
     )
+
+    best_val_acc = 0.0
+    epochs_without_improvement = 0
+    plateau_epochs = 0
+    lr_reductions = 0
+
+    epochs_ran = 0
+    best_checkpoint_epoch: Optional[int] = None
+
+    config.run_dir.mkdir(parents=True, exist_ok=True)
+    best_checkpoint_path = config.run_dir / "finetuned_model_best.pt"
 
     with SummaryWriter(config.run_dir) as writer:
         for epoch in range(1, config.epochs + 1):
@@ -316,16 +374,141 @@ def run_training(config: TrainingConfig) -> None:
                 optimizer=optimizer,
                 accumulation_steps=config.accumulation_steps,
                 epoch_index=epoch,
+                device=config.device,
+                scaler=scaler,
+                zero_grad_set_to_none=config.zero_grad_set_to_none,
+                amp_enabled=amp_enabled,
             )
-            val_acc = evaluate(val_loader, model, processor, config.device)
+            val_acc = evaluate(
+                val_loader,
+                model,
+                processor,
+                config.device,
+                amp_enabled=amp_enabled,
+            )
             LOGGER.info("Epoch %d | Validation accuracy %.4f", epoch, val_acc)
             writer.add_scalar("val/accuracy", val_acc, epoch)
+            epochs_ran = epoch
 
-        test_acc = evaluate(test_loader, model, processor, config.device)
-        LOGGER.info("Final test accuracy %.4f", test_acc)
-        writer.add_scalar("test/accuracy", test_acc, config.epochs)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                epochs_without_improvement = 0
+                plateau_epochs = 0
+                model_to_snapshot = (
+                    model.module if isinstance(model, torch.nn.DataParallel) else model
+                )
+                state_dict_cpu = {
+                    key: value.detach().cpu()
+                    for key, value in model_to_snapshot.state_dict().items()
+                }
+                snapshot_payload = {
+                    "state_dict": state_dict_cpu,
+                    "config": model_to_snapshot.config.to_dict(),
+                }
+                torch.save(snapshot_payload, best_checkpoint_path)
+                best_checkpoint_epoch = epoch
+                del state_dict_cpu, snapshot_payload
+                LOGGER.info(
+                    "New best validation accuracy %.4f at epoch %d; saved checkpoint to %s.",
+                    best_val_acc,
+                    epoch,
+                    best_checkpoint_path,
+                )
+            else:
+                epochs_without_improvement += 1
+                plateau_epochs += 1
+                LOGGER.info(
+                    "Validation accuracy did not improve for %d epoch(s)",
+                    epochs_without_improvement,
+                )
 
-    maybe_run_demo(model=model, processor=processor, id_to_label=id_to_label)
+                reduced_lr_this_round = False
+                if plateau_epochs >= config.lr_patience:
+                    current_lr = optimizer.param_groups[0]["lr"]
+                    can_reduce_lr = (
+                        lr_reductions < config.max_lr_reductions
+                        and config.lr_decay_factor < 1.0
+                        and current_lr > config.min_learning_rate
+                    )
+                    if can_reduce_lr:
+                        new_lr_target = current_lr * config.lr_decay_factor
+                        new_lr = max(new_lr_target, config.min_learning_rate)
+                        if new_lr < current_lr:
+                            for group in optimizer.param_groups:
+                                group["lr"] = new_lr
+                            lr_reductions += 1
+                            plateau_epochs = 0
+                            epochs_without_improvement = 0
+                            reduced_lr_this_round = True
+                            LOGGER.info(
+                                "Reducing learning rate from %e to %e (%d/%d reduction)",
+                                current_lr,
+                                new_lr,
+                                lr_reductions,
+                                config.max_lr_reductions,
+                            )
+                        else:
+                            can_reduce_lr = False
+                            LOGGER.info(
+                                "Learning rate already at minimum threshold (%e); cannot reduce further.",
+                                current_lr,
+                            )
+                    else:
+                        reasons = []
+                        if lr_reductions >= config.max_lr_reductions:
+                            reasons.append("maximum reductions reached")
+                        if config.lr_decay_factor >= 1.0:
+                            reasons.append("decay factor >= 1.0")
+                        if current_lr <= config.min_learning_rate:
+                            reasons.append("current lr at minimum")
+                        LOGGER.info(
+                            "Skipping learning rate reduction (%s).",
+                            ", ".join(reasons) if reasons else "constraints not met",
+                        )
+                    if not reduced_lr_this_round:
+                        plateau_epochs = 0
+
+                if epochs_without_improvement >= config.early_stopping_patience:
+                    LOGGER.info(
+                        "Early stopping triggered after %d non-improving epoch(s); current lr %e",
+                        epochs_without_improvement,
+                        optimizer.param_groups[0]["lr"],
+                    )
+                    break
+
+        test_acc = None
+        if best_checkpoint_epoch is not None:
+            LOGGER.info(
+                "Loading best model from epoch %d for final evaluation (%s)",
+                best_checkpoint_epoch,
+                best_checkpoint_path,
+            )
+            checkpoint_payload = torch.load(best_checkpoint_path, map_location=config.device)
+            if isinstance(checkpoint_payload, Mapping) and "state_dict" in checkpoint_payload:
+                best_state = checkpoint_payload["state_dict"]
+            else:
+                best_state = checkpoint_payload
+            model_to_eval = model.module if isinstance(model, torch.nn.DataParallel) else model
+            model_to_eval.load_state_dict(best_state, strict=False)
+            test_acc = evaluate(
+                test_loader,
+                model,
+                processor,
+                config.device,
+                amp_enabled=amp_enabled,
+            )
+            LOGGER.info("Final test accuracy (best model) %.4f", test_acc)
+            writer.add_scalar("test/accuracy", test_acc, max(epochs_ran, 1))
+        else:
+            LOGGER.info("Best model snapshot not available; skipping final test evaluation.")
+
+    maybe_run_demo(
+        model=model,
+        processor=processor,
+        id_to_label=id_to_label,
+        device=config.device,
+        amp_enabled=amp_enabled,
+    )
 
 
 def parse_args() -> argparse.Namespace:

@@ -1,6 +1,7 @@
 import argparse
 import pathlib
-from typing import Iterable, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Iterable, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -103,25 +104,22 @@ def build_output_path(
     return output_path
 
 
-def to_model_batch(frames_rgb: List[np.ndarray], frames_per_clip: int) -> np.ndarray:
-    padded = frames_rgb
-    if len(frames_rgb) < frames_per_clip and frames_rgb:
-        padded = frames_rgb + [frames_rgb[-1]] * (frames_per_clip - len(frames_rgb))
-    array = np.stack(padded, axis=0)  # (T, H, W, C)
-    return array.transpose(0, 3, 1, 2)  # (T, C, H, W)
-
-
 def predict_clip(
-    frames_rgb: List[np.ndarray],
+    frames_rgb: Sequence[np.ndarray],
     *,
     frames_per_clip: int,
     processor: AutoVideoProcessor,
     model: AutoModelForVideoClassification,
 ) -> Tuple[str, float]:
-    video_batch = to_model_batch(frames_rgb, frames_per_clip)
-    inputs = processor(video_batch, return_tensors="pt").to(model.device)
+    clip = list(frames_rgb)
+    if clip and len(clip) < frames_per_clip:
+        clip = clip + [clip[-1]] * (frames_per_clip - len(clip))
+    inputs = processor(videos=[clip[:frames_per_clip]], return_tensors="pt")
+    inputs = {name: tensor.to(model.device) for name, tensor in inputs.items()}
+    amp_enabled = model.device.type == "cuda"
     with torch.no_grad():
-        logits = model(**inputs).logits
+        with torch.cuda.amp.autocast(enabled=amp_enabled):
+            logits = model(**inputs).logits
     probs = torch.softmax(logits, dim=-1)[0]
     top_prob, top_idx = torch.max(probs, dim=-1)
     label = model.config.id2label[top_idx.item()]
@@ -175,73 +173,84 @@ def process_video(
     if not fps or np.isnan(fps) or fps <= 0:
         fps = 25.0
 
-    ret, frame = capture.read()
-    if not ret:
-        capture.release()
-        raise RuntimeError(f"No frames read from {video_path}")
-
-    height, width = frame.shape[:2]
     writer = None
-    if output_path is not None:
-        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-        if not writer.isOpened():
-            capture.release()
-            raise RuntimeError(f"Failed to create writer for {output_path}")
+    window_open = False
 
-    if show:
-        cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-
-    frames_rgb: List[np.ndarray] = []
-    frames_bgr: List[np.ndarray] = []
+    clip_buffer: Deque[np.ndarray] = deque()
     total_frames = 0
     processed_clips = 0
 
+    def ensure_writer(width: int, height: int) -> None:
+        nonlocal writer
+        if writer is None and output_path is not None:
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
+            if not writer.isOpened():
+                raise RuntimeError(f"Failed to create writer for {output_path}")
+
+    def ensure_window() -> None:
+        nonlocal window_open
+        if show and not window_open:
+            cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+            window_open = True
+
+    def prepare_clip_rgb(frames: Sequence[np.ndarray]) -> List[np.ndarray]:
+        return [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) for frame in frames]
+
+    def emit_clip(frames: Sequence[np.ndarray], label: str, prob: float) -> bool:
+        return annotate_and_emit(
+            frames,
+            label=label,
+            probability=prob,
+            writer=writer,
+            show=window_open,
+        )
+
     def flush_clip() -> bool:
-        nonlocal frames_rgb, frames_bgr, processed_clips
-        if not frames_rgb:
+        nonlocal processed_clips
+        if not clip_buffer:
             return False
+        frames = list(clip_buffer)
+        clip_rgb = prepare_clip_rgb(frames)
         label, prob = predict_clip(
-            frames_rgb,
+            clip_rgb,
             frames_per_clip=frames_per_clip,
             processor=processor,
             model=model,
         )
         processed_clips += 1
-        stop_requested = annotate_and_emit(
-            frames_bgr,
-            label=label,
-            probability=prob,
-            writer=writer,
-            show=show,
-        )
-        frames_rgb = []
-        frames_bgr = []
+        stop_requested = emit_clip(frames, label, prob)
+        clip_buffer.clear()
         return stop_requested
 
-    frames_rgb.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-    frames_bgr.append(frame)
-    total_frames += 1
-
     stop = False
-    while True:
-        ret, frame = capture.read()
-        if not ret:
-            stop = flush_clip()
-            break
-        frames_rgb.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        frames_bgr.append(frame)
-        total_frames += 1
-        if len(frames_rgb) == frames_per_clip:
-            stop = flush_clip()
-            if stop:
+    try:
+        while True:
+            ret, frame = capture.read()
+            if not ret:
+                stop = flush_clip()
                 break
 
-    capture.release()
-    if writer is not None:
-        writer.release()
-    if show:
-        cv2.destroyWindow(WINDOW_NAME)
+            total_frames += 1
+
+            ensure_writer(frame.shape[1], frame.shape[0])
+            ensure_window()
+
+            clip_buffer.append(frame)
+            if len(clip_buffer) == frames_per_clip:
+                stop = flush_clip()
+                if stop:
+                    break
+    finally:
+        capture.release()
+        if writer is not None:
+            writer.release()
+        if window_open:
+            cv2.destroyWindow(WINDOW_NAME)
+            window_open = False
+
+    if total_frames == 0:
+        raise RuntimeError(f"No frames read from {video_path}")
 
     if not quiet:
         print(
