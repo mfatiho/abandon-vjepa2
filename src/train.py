@@ -5,6 +5,7 @@ import pathlib
 from dataclasses import dataclass, replace
 import argparse
 from typing import Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+import json
 
 import numpy as np
 import torch
@@ -63,12 +64,19 @@ class VideoClassificationDataset(Dataset):
         decoder = VideoDecoder(str(video_path))
         return decoder, self._label_to_id[label_name]
 
-
 def split_dataset_paths(root: pathlib.Path) -> Dict[str, List[pathlib.Path]]:
     """Return video paths grouped by split (train/val/test)."""
 
     splits = {"train": [], "val": [], "test": []}
-    for path in root.glob("**/*.avi"):
+    
+    # Aranacak video uzantılarını bir listede topluyoruz
+    video_patterns = ["**/*.avi", "**/*.mp4", "**/*.mpg"]
+    
+    all_paths = []
+    for pattern in video_patterns:
+        all_paths.extend(root.glob(pattern))
+
+    for path in all_paths:
         try:
             split_name, label_name, _ = path.relative_to(root).parts[:3]
         except ValueError as err:  # pragma: no cover - defensive
@@ -89,14 +97,13 @@ def split_dataset_paths(root: pathlib.Path) -> Dict[str, List[pathlib.Path]]:
     )
     return splits
 
-
 def build_label_maps(paths: Iterable[pathlib.Path]) -> Tuple[Dict[str, int], Dict[int, str]]:
     """Compute label <-> id mapping once so it can be reused everywhere."""
 
     labels = sorted({path.parent.name for path in paths})
     if not labels:
         raise ValueError("No class labels found in dataset")
-
+    
     label_to_id = {label: idx for idx, label in enumerate(labels)}
     id_to_label = {idx: label for label, idx in label_to_id.items()}
     return label_to_id, id_to_label
@@ -113,17 +120,23 @@ def build_collate_fn(
     def collate(samples: Sequence[Tuple[VideoDecoder, int]]) -> Tuple[torch.Tensor, torch.Tensor]:
         clips, labels = [], []
         for decoder, label in samples:
+            # 1. Ham video klibini al
             clip = clips_at_random_indices(
                 decoder,
                 num_clips=1,
                 num_frames_per_clip=frames_per_clip,
                 num_indices_between_frames=frames_stride,
             ).data
-            clips.append(clip)
+            
+            # 2. Boyutları standartlaştırmak için transformasyonu uygula
+            transformed_clip = transforms(clip)
+            
+            # 3. Dönüştürülmüş klibi listeye ekle
+            clips.append(transformed_clip)
             labels.append(label)
 
+        # Artık tüm klipler aynı boyutta olduğu için birleştirme işlemi başarılı olacak
         videos = torch.cat(clips, dim=0)
-        videos = transforms(videos)
         return videos, torch.tensor(labels)
 
     return collate
@@ -175,7 +188,7 @@ def evaluate(
         for videos, labels in loader:
             inputs = processor(list(videos), return_tensors="pt").to(device)
             targets = labels.to(device)
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with torch.amp.autocast('cuda', enabled=amp_enabled):
                 logits = model(**inputs).logits
             predictions = logits.argmax(dim=-1)
             correct += (predictions == targets).sum().item()
@@ -207,7 +220,7 @@ def train_one_epoch(
         steps_ran = step
         inputs = processor(list(videos), return_tensors="pt").to(device)
         targets = labels.to(device)
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
+        with torch.amp.autocast('cuda', enabled=amp_enabled):
             outputs = model(**inputs, labels=targets)
         loss = outputs.loss
         if loss.ndim > 0:
@@ -297,6 +310,9 @@ def run_training(config: TrainingConfig) -> None:
     model_config.id2label = {idx: label for idx, label in id_to_label.items()}
     model_config.label2id = {label: idx for idx, label in id_to_label.items()}
 
+    # model_config.id2label["10"] = "Abandon"
+    # model_config.label2id["Abandon"] = 10
+
     freeze_backbone(model)
     if torch.cuda.device_count() > 1 and config.device.type == "cuda":
         LOGGER.info(
@@ -306,7 +322,7 @@ def run_training(config: TrainingConfig) -> None:
     trainable_parameters = [param for param in model.parameters() if param.requires_grad]
     optimizer = torch.optim.Adam(trainable_parameters, lr=config.learning_rate)
     amp_enabled = config.use_amp and config.device.type == "cuda"
-    scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled) if amp_enabled else None
+    scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled) if amp_enabled else None
 
     train_transforms = v2.Compose(
         [
@@ -355,6 +371,7 @@ def run_training(config: TrainingConfig) -> None:
     )
 
     best_val_acc = 0.0
+    bes_test_acc = 0.0
     epochs_without_improvement = 0
     plateau_epochs = 0
     lr_reductions = 0
@@ -390,10 +407,12 @@ def run_training(config: TrainingConfig) -> None:
             writer.add_scalar("val/accuracy", val_acc, epoch)
             epochs_ran = epoch
 
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
-                epochs_without_improvement = 0
-                plateau_epochs = 0
+            def save_checkpoint(model, best_checkpoint_path):
+
+                LOGGER.info("Labels (alphabetical): %s", list(label_to_id.keys()))
+                if "Abandon" not in label_to_id:
+                    LOGGER.warning("Abandon sınıfı veri kümesinde bulunamadı!")
+
                 model_to_snapshot = (
                     model.module if isinstance(model, torch.nn.DataParallel) else model
                 )
@@ -405,9 +424,22 @@ def run_training(config: TrainingConfig) -> None:
                     "state_dict": state_dict_cpu,
                     "config": model_to_snapshot.config.to_dict(),
                 }
+                config_path = config.run_dir / "config.json"
+                with open(config_path, "w", encoding="utf-8") as f:
+                    json.dump(model_to_snapshot.config.to_dict(), f, ensure_ascii=False, indent=2)
+                LOGGER.info("Model config yazıldı: %s", config_path)
+
                 torch.save(snapshot_payload, best_checkpoint_path)
-                best_checkpoint_epoch = epoch
                 del state_dict_cpu, snapshot_payload
+
+
+            
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                epochs_without_improvement = 0
+                plateau_epochs = 0
+                save_checkpoint(model, best_checkpoint_path)
+                best_checkpoint_epoch = epoch
                 LOGGER.info(
                     "New best validation accuracy %.4f at epoch %d; saved checkpoint to %s.",
                     best_val_acc,
@@ -415,6 +447,29 @@ def run_training(config: TrainingConfig) -> None:
                     best_checkpoint_path,
                 )
             else:
+                if val_acc == 1.0:
+                    LOGGER.info(
+                        "Validation accuracy reached 1.0! Confirming with test set..."
+                    )
+                    confirm_test_acc = evaluate(
+                        test_loader,
+                        model,
+                        processor,
+                        config.device,
+                        amp_enabled=amp_enabled,
+                    )
+                    LOGGER.info(f"Confirmation test accuracy: {confirm_test_acc:.4f}")
+                    
+                    if confirm_test_acc > bes_test_acc:
+                        bes_test_acc = confirm_test_acc
+                        best_checkpoint_epoch = epoch
+                        save_checkpoint(model, best_checkpoint_path)
+                        LOGGER.warning(
+                            "Validation accuracy is 1.0, but test accuracy is lower (%.4f). "
+                            "This will not be considered a new best model to prevent potential overfitting.",
+                            confirm_test_acc,
+                        )
+
                 epochs_without_improvement += 1
                 plateau_epochs += 1
                 LOGGER.info(

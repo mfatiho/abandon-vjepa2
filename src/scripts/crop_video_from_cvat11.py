@@ -49,6 +49,8 @@ class TrackData:
     crop_box: CropBox | None = None
     frames_written: int = 0
     output_path: Path | None = None
+    adjusted_start_frame: int | None = None
+    adjusted_end_frame: int | None = None
 
     def update_bounds(self, xtl: float, ytl: float, xbr: float, ybr: float) -> None:
         self.min_xtl = min(self.min_xtl, xtl)
@@ -77,10 +79,14 @@ class TrackData:
 
     @property
     def start_frame(self) -> int:
+        if self.adjusted_start_frame is not None:
+            return self.adjusted_start_frame
         return min(self.frame_boxes)
 
     @property
     def end_frame(self) -> int:
+        if self.adjusted_end_frame is not None:
+            return self.adjusted_end_frame
         return max(self.frame_boxes)
 
 
@@ -148,6 +154,61 @@ def parse_cvat_annotations(
             logging.info("Ignoring track %d (%s) with no valid boxes.", track_id, label)
 
     return tracks, frames_to_tracks
+
+
+def apply_frame_offsets(
+    tracks: Dict[int, TrackData],
+    frames_to_tracks: Dict[int, List[int]],
+    start_offset: int,
+    end_offset: int,
+) -> Dict[int, List[int]]:
+    """Extend track coverage by adding frames before and after annotated range."""
+    if start_offset == 0 and end_offset == 0:
+        for track in tracks.values():
+            track.adjusted_start_frame = None
+            track.adjusted_end_frame = None
+        return frames_to_tracks
+
+    extended: Dict[int, List[int]] = defaultdict(list)
+    for frame, ids in frames_to_tracks.items():
+        extended[frame].extend(ids)
+
+    for track in tracks.values():
+        if not track.frame_boxes:
+            track.adjusted_start_frame = None
+            track.adjusted_end_frame = None
+            continue
+
+        original_start = min(track.frame_boxes)
+        original_end = max(track.frame_boxes)
+
+        raw_start = original_start - start_offset
+        effective_start = max(0, raw_start)
+        extended_end = original_end + end_offset
+
+        track.adjusted_start_frame = effective_start if start_offset > 0 else None
+        track.adjusted_end_frame = extended_end if end_offset > 0 else None
+
+        if effective_start < original_start:
+            for frame in range(effective_start, original_start):
+                extended[frame].append(track.track_id)
+
+        if extended_end > original_end:
+            for frame in range(original_end + 1, extended_end + 1):
+                extended[frame].append(track.track_id)
+
+    deduped: Dict[int, List[int]] = {}
+    for frame in sorted(extended):
+        ids = extended[frame]
+        seen: set[int] = set()
+        ordered: List[int] = []
+        for tid in ids:
+            if tid not in seen:
+                seen.add(tid)
+                ordered.append(tid)
+        deduped[frame] = ordered
+
+    return deduped
 
 
 def ensure_output_directory(path: Path) -> None:
@@ -293,6 +354,8 @@ def crop_video_with_annotations(
     output_dir: Path,
     fourcc: int,
     fallback_fps: float,
+    start_frame_offset: int,
+    end_frame_offset: int,
     label_filter: set[str] | None = None,
 ) -> Dict[int, TrackData]:
     if not video_path.exists():
@@ -324,6 +387,24 @@ def crop_video_with_annotations(
                 video_path,
             )
             return {}
+
+    frames_to_tracks = apply_frame_offsets(tracks, frames_to_tracks, start_frame_offset, end_frame_offset)
+    if not tracks:
+        logging.warning(
+            "No tracks remain for %s after applying frame offsets (start=%d, end=%d).",
+            video_path,
+            start_frame_offset,
+            end_frame_offset,
+        )
+        return {}
+    if not frames_to_tracks:
+        logging.warning(
+            "No frames remain for %s after applying frame offsets (start=%d, end=%d).",
+            video_path,
+            start_frame_offset,
+            end_frame_offset,
+        )
+        return {}
 
     logging.info("Preparing video capture for %s.", video_path)
     cap, frame_w, frame_h, fps = prepare_video_capture(video_path)
@@ -365,6 +446,17 @@ def crop_video_with_annotations(
 def close_writers(writers: Iterable[cv2.VideoWriter]) -> None:
     for writer in writers:
         writer.release()
+
+
+def non_negative_int(value: str) -> int:
+    """argparse helper that ensures provided integer values are non-negative."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"Expected a non-negative integer, got {value!r}.") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"Value must be >= 0, got {parsed}.")
+    return parsed
 
 
 def parse_args() -> argparse.Namespace:
@@ -414,6 +506,18 @@ def parse_args() -> argparse.Namespace:
         help="FPS to use if the input video FPS cannot be read (default: 25).",
     )
     parser.add_argument(
+        "--start-frame-offset",
+        type=non_negative_int,
+        default=0,
+        help="Number of extra frames to include before the first annotated frame of each track.",
+    )
+    parser.add_argument(
+        "--end-frame-offset",
+        type=non_negative_int,
+        default=0,
+        help="Number of extra frames to include after the last annotated frame of each track.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Enable verbose logging.",
@@ -434,6 +538,8 @@ def process_dataset(
     output_root: Path,
     fourcc: int,
     fallback_fps: float,
+    start_frame_offset: int,
+    end_frame_offset: int,
     label_filter: set[str] | None,
 ) -> None:
     if not csv_path.exists():
@@ -504,6 +610,8 @@ def process_dataset(
                                     split_dir,
                                     fourcc,
                                     fallback_fps,
+                                    start_frame_offset,
+                                    end_frame_offset,
                                     label_filter,
                                 )
                         except KeyError:
@@ -520,6 +628,8 @@ def process_dataset(
                         split_dir,
                         fourcc,
                         fallback_fps,
+                        start_frame_offset,
+                        end_frame_offset,
                         label_filter,
                     )
             except zipfile.BadZipFile as exc:
@@ -565,7 +675,15 @@ def main() -> None:
     label_filter = set(args.labels) if args.labels else None
     fourcc = cv2.VideoWriter_fourcc(*args.codec)
     if args.csv:
-        process_dataset(args.csv, args.output_dir, fourcc, args.fallback_fps, label_filter)
+        process_dataset(
+            args.csv,
+            args.output_dir,
+            fourcc,
+            args.fallback_fps,
+            args.start_frame_offset,
+            args.end_frame_offset,
+            label_filter,
+        )
         return
 
     if not args.input_video or not args.annotations:
@@ -586,6 +704,8 @@ def main() -> None:
                         args.output_dir,
                         fourcc,
                         args.fallback_fps,
+                        args.start_frame_offset,
+                        args.end_frame_offset,
                         label_filter,
                     )
             except KeyError as exc:
@@ -597,6 +717,8 @@ def main() -> None:
             args.output_dir,
             fourcc,
             args.fallback_fps,
+            args.start_frame_offset,
+            args.end_frame_offset,
             label_filter,
         )
 

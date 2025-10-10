@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--enable-video-writer",
+        action="store_true",
+        help="Write the annotated video to disk.",
+    )
+    parser.add_argument(
         "--label-map",
         type=pathlib.Path,
         help=(
@@ -377,8 +382,13 @@ def run_inference(args: argparse.Namespace) -> None:
     fps = capture.get(cv2.CAP_PROP_FPS)
     fps = float(fps) if fps and fps > 0 else 30.0
 
-    output_path = resolve_output_path(args.video, args.output)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.output and not args.enable_video_writer:
+        raise ValueError("--output requires --enable-video-writer.")
+
+    output_path: Optional[pathlib.Path] = None
+    if args.enable_video_writer:
+        output_path = resolve_output_path(args.video, args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
 
     writer = None
     frame_buffer: deque[np.ndarray] = deque(maxlen=clip_span)
@@ -390,7 +400,7 @@ def run_inference(args: argparse.Namespace) -> None:
     show_enabled = bool(args.show)
     show_window_open = False
     postprocess_preview = False
-
+    primary_score = 0.0
     try:
         if show_enabled:
             try:
@@ -408,7 +418,7 @@ def run_inference(args: argparse.Namespace) -> None:
 
             frame_buffer.append(frame_bgr)
 
-            if writer is None:
+            if args.enable_video_writer and writer is None:
                 height, width = frame_bgr.shape[:2]
                 writer = cv2.VideoWriter(
                     str(output_path),
@@ -446,8 +456,8 @@ def run_inference(args: argparse.Namespace) -> None:
                     for rank, (label, score) in enumerate(top_predictions, start=1):
                         LOGGER.info("  #%d %s — %.2f%%", rank, label, score * 100)
                     last_top_label = primary_label
-
-            annotate_frame(frame_bgr, overlay_text)
+            if primary_score > 0.7:
+                annotate_frame(frame_bgr, overlay_text)
             if show_enabled and show_window_open:
                 try:
                     cv2.imshow(window_title, frame_bgr)
@@ -476,10 +486,13 @@ def run_inference(args: argparse.Namespace) -> None:
         if show_window_open:
             cv2.destroyWindow(window_title)
 
-    if writer is None:
+    if args.enable_video_writer and writer is None:
         raise RuntimeError(f"Video {args.video} does not contain any frames.")
 
-    LOGGER.info("Annotated video written to %s", output_path)
+    if args.enable_video_writer:
+        LOGGER.info("Annotated video written to %s", output_path)
+    else:
+        LOGGER.info("Video writer disabled; annotated frames were not saved to disk.")
     if not performed_inference:
         LOGGER.warning(
             "The video never reached %d frames; no model inference was performed.",
@@ -487,7 +500,10 @@ def run_inference(args: argparse.Namespace) -> None:
         )
 
     if args.show and postprocess_preview:
-        try_show_video("VJEPA2 Prediction", output_path)
+        if args.enable_video_writer and output_path is not None:
+            try_show_video("VJEPA2 Prediction", output_path)
+        else:
+            LOGGER.info("Cannot preview output video because the writer is disabled.")
 
 
 def main() -> None:  # pragma: no cover - CLI entry point

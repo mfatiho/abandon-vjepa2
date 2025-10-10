@@ -118,7 +118,7 @@ def predict_clip(
     inputs = {name: tensor.to(model.device) for name, tensor in inputs.items()}
     amp_enabled = model.device.type == "cuda"
     with torch.no_grad():
-        with torch.cuda.amp.autocast(enabled=amp_enabled):
+        with torch.amp.autocast(device_type="cuda", enabled=amp_enabled):
             logits = model(**inputs).logits
     probs = torch.softmax(logits, dim=-1)[0]
     top_prob, top_idx = torch.max(probs, dim=-1)
