@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import pathlib
+import time
 from collections import deque
 from typing import List, Mapping, Optional, Sequence, Tuple
 
@@ -207,6 +208,34 @@ def annotate_frame(frame: np.ndarray, text: str) -> None:
     )
 
 
+def overlay_fps(frame: np.ndarray, fps_value: float) -> None:
+    """Render running FPS estimate in the bottom-left corner of the frame."""
+    if fps_value <= 0:
+        return
+    text = f"FPS: {fps_value:.1f}"
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.6
+    thickness = 2
+    padding = 10
+    height, width = frame.shape[:2]
+    text_size, _ = cv2.getTextSize(text, font, font_scale, thickness)
+    text_width, text_height = text_size
+    origin = (padding, height - padding)
+    background_tl = (origin[0] - padding // 2, origin[1] - text_height - padding // 2)
+    background_br = (origin[0] + text_width + padding // 2, origin[1] + padding // 2)
+    cv2.rectangle(frame, background_tl, background_br, color=(0, 0, 0), thickness=-1)
+    cv2.putText(
+        frame,
+        text,
+        origin,
+        font,
+        font_scale,
+        color=(255, 255, 255),
+        thickness=thickness,
+        lineType=cv2.LINE_AA,
+    )
+
+
 def prepare_clip_tensor(
     processor: AutoVideoProcessor,
     sampled_frames: Sequence[np.ndarray],
@@ -395,6 +424,10 @@ def run_inference(args: argparse.Namespace) -> None:
     overlay_text = "Collecting frames..."
     last_top_label: Optional[str] = None
     performed_inference = False
+    fps_samples: deque[float] = deque(maxlen=60)
+    fps_sum = 0.0
+    last_frame_time: Optional[float] = None
+    min_fps_samples = 10
 
     window_title = "VJEPA2 Prediction"
     show_enabled = bool(args.show)
@@ -415,6 +448,18 @@ def run_inference(args: argparse.Namespace) -> None:
             ok, frame_bgr = capture.read()
             if not ok:
                 break
+
+            now = time.perf_counter()
+            if last_frame_time is not None:
+                delta = now - last_frame_time
+                if delta > 0:
+                    sample = 1.0 / delta
+                    sample = min(sample, 240.0)
+                    if len(fps_samples) == fps_samples.maxlen:
+                        fps_sum -= fps_samples[0]
+                    fps_samples.append(sample)
+                    fps_sum += sample
+            last_frame_time = now
 
             frame_buffer.append(frame_bgr)
 
@@ -458,6 +503,10 @@ def run_inference(args: argparse.Namespace) -> None:
                     last_top_label = primary_label
             if primary_score > 0.7:
                 annotate_frame(frame_bgr, overlay_text)
+            enough_samples = len(fps_samples) >= min_fps_samples
+            avg_fps = (fps_sum / len(fps_samples)) if enough_samples else 0.0
+            if args.show and avg_fps > 0:
+                overlay_fps(frame_bgr, avg_fps)
             if show_enabled and show_window_open:
                 try:
                     cv2.imshow(window_title, frame_bgr)

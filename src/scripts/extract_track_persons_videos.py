@@ -200,7 +200,7 @@ def track_and_crop_memory_efficient(video_path, output_dir, confidence_threshold
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="YOLOv11 ile bir videodaki kişileri takip eden ve her birini ayrı videolara kırpan, bellek verimli bir script.")
-    parser.add_argument("video-path", type=str, help="İşlenecek video dosyasının yolu.")
+    parser.add_argument("video_path", type=str, help="İşlenecek video dosyasının yolu.")
     parser.add_argument("--output-dir", type=str, default="kirpilmis_videolar_mem_efficient", help="Kırpılmış videoların kaydedileceği klasör.")
     parser.add_argument("--conf", type=float, default=0.4, help="Tespit için minimum güven eşiği (0.0 ile 1.0 arası).")
     parser.add_argument("--min-frame-count", type=int, default=32, help="Kişi videolarının kaydedilmesi için gereken minimum kare sayısı.")
